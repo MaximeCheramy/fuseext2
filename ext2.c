@@ -379,6 +379,31 @@ static int alloc_inode(struct ext2_inode *inode) {
 	return 0;
 }
 
+static void free_block(uint32_t blk) {
+	int i = blk / superblock.s_blocks_per_group; // Groupe de block.
+	int ib = blk - superblock.s_blocks_per_group * i; // Indice dans le groupe.
+	int addr_bitmap = group_desc_table[i].bg_block_bitmap;
+
+	uint8_t block_bitmap;
+	pread(fd, &(block_bitmap), sizeof(uint8_t), addr_bitmap * (1024 << superblock.s_log_block_size) + ib / 8);
+	block_bitmap &= ~(1 << (ib % 8));
+	pwrite(fd, &(block_bitmap), sizeof(uint8_t), addr_bitmap * (1024 << superblock.s_log_block_size) + ib / 8);
+	
+	// TODO: increment bg_free_blocks_count
+}
+
+static void free_inode(int inode) {
+	int i = inode / superblock.s_blocks_per_group; // Groupe de block.
+	int ib = inode - superblock.s_blocks_per_group * i; // Indice dans le groupe.
+	int addr_bitmap = group_desc_table[i].bg_inode_bitmap;
+
+	uint8_t block_bitmap;
+	pread(fd, &(block_bitmap), sizeof(uint8_t), addr_bitmap * (1024 << superblock.s_log_block_size) + ib / 8);
+	block_bitmap &= ~(1 << (ib % 8));
+	pwrite(fd, &(block_bitmap), sizeof(uint8_t), addr_bitmap * (1024 << superblock.s_log_block_size) + ib / 8);
+}
+
+
 static void add_dir_entry(int inode, const char *name, int type, int n_inode) {
 	struct blk_t *blocks = addr_inode_data(inode);
 
@@ -763,7 +788,55 @@ static int ext2_chown(const char * path, uid_t uid, gid_t gid) {
 static int ext2_truncate(const char * path, off_t off) {
 	int inode = getinode_from_path(path);
 	fprintf(stderr, "truncate inode %d (%s) : %d\n", inode, path, (int)off);
-	return 0;
+	if (inode > 0) {
+		uint32_t size = off;
+		struct ext2_inode einode;
+		if (read_inode(inode, &einode) >= 0) {
+			struct blk_t *blocks = addr_inode_data(inode);
+			struct blk_t *aux = blocks;
+			struct blk_t *prec = NULL;
+			int first = 1;
+			while (aux) {
+				if (off <= 0) {
+					free_block(aux->addr);
+					if (first) {
+						if (prec == NULL) {
+							blocks = NULL;
+						} else {
+							prec->next = NULL;
+						}
+						first = 0;
+					}
+					prec = aux;
+					aux = aux->next;
+					free(prec);
+				} else {
+					off -= 1024 << superblock.s_log_block_size;
+					prec = aux;
+					aux = aux->next;
+				}
+			}
+			while (off > 0) {
+				struct blk_t *element = malloc(sizeof(struct blk_t));
+				element->addr = alloc_block();
+				element->next = NULL;
+				if (prec == NULL) {
+					blocks = element;
+				} else {
+					prec->next = element;
+				}
+				prec = element;
+				off -= 1024 << superblock.s_log_block_size;
+			}
+			einode.i_size = size;
+			printf("nouvelle taille : %d\n", einode.i_size);
+			update_blocks(&einode, blocks);
+			write_inode(inode, &einode);
+			return 0;
+		}
+	}
+
+	return -ENOENT;
 }
 
 static int ext2_unlink(const char * path) {
